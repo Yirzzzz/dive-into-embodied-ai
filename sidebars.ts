@@ -69,8 +69,10 @@ const sidebars: SidebarsConfig = {
       collapsed: false,
       items: [
         { type: 'link', label: '视觉语言大模型(VLM)', href: '/docs/foundations/vlm/intro' },
-        { type: 'link', label: '定位、触觉与传感器标定', href: '/docs/foundations/perception/placeholder' },
-        { type: 'link', label: '传感器标定与 sim2real', href: '/docs/foundations/perception/sensor-calibration-sim2real' },
+        { type: 'link', label: '传感器标定与 sim2real', href: '/docs/foundations/perception/1.sensor-calibration-sim2real' },
+        { type: 'link', label: 'ODO、时间戳与状态估计', href: '/docs/foundations/perception/2.odo-timestamps-state-estimation' },
+        { type: 'link', label: '相机、LiDAR 与 IMU 外参与投影', href: '/docs/foundations/perception/3.sensor-projection' },
+        { type: 'link', label: '在线标定、评测与故障诊断', href: '/docs/foundations/perception/4.online-calibration-diagnosis' },
       ],
     },
     {
