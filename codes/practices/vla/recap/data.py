@@ -17,6 +17,7 @@ REPOS = {
     "train": ("RECAP_REPO_ID", "local/libero10_task0_train"),
     "eval": ("RECAP_EVAL_REPO_ID", "local/libero10_task0_eval"),
 }
+EXPECTED_EPISODES = {"sft": 30, "train": 4096, "eval": 64}
 COLUMNS = ("state", "actions", "timestamp", "frame_index", "episode_index", "index", "task_index")
 
 
@@ -36,21 +37,50 @@ def write_jsonl(path, rows):
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
 
+def validate_download(raw_dir):
+    """Reject Hugging Face's offline fallback to an empty or partial local_dir."""
+    for split, expected in EXPECTED_EPISODES.items():
+        source = raw_dir / f"libero10_task0_{split}"
+        info_path = source / "meta/info.json"
+        episodes_path = source / "meta/episodes.jsonl"
+        tasks_path = source / "meta/tasks.jsonl"
+        if not all(path.is_file() for path in (info_path, episodes_path, tasks_path)):
+            raise FileNotFoundError(f"{split}: metadata is incomplete")
+        info = json.loads(info_path.read_text())
+        rows = read_jsonl(episodes_path)
+        if info.get("total_episodes") != expected or len(rows) != expected:
+            raise ValueError(f"{split}: expected {expected} episodes, found {len(rows)}")
+        for row in rows:
+            ep = row["episode_index"]
+            fields = {"episode_chunk": ep // info["chunks_size"], "episode_index": ep}
+            data_path = source / info["data_path"].format(**fields)
+            videos = [source / info["video_path"].format(**fields, video_key=key) for key in ("image", "wrist_image")]
+            if not data_path.is_file() or not all(path.is_file() for path in videos):
+                raise FileNotFoundError(f"{split}: episode {ep} data or video is incomplete")
+
+
 def download(raw_dir):
     from huggingface_hub import snapshot_download
 
     raw_dir.mkdir(parents=True, exist_ok=True)
     marker = raw_dir / "INCOMPLETE"
     marker.touch()
-    snapshot_download(
-        repo_id=DATASET_ID,
-        repo_type="dataset",
-        revision=DATASET_REVISION,
-        allow_patterns=[f"libero10_task0_{split}/*" for split in REPOS],
-        local_dir=raw_dir,
-    )
+    endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+    try:
+        snapshot_download(
+            repo_id=DATASET_ID,
+            repo_type="dataset",
+            revision=DATASET_REVISION,
+            allow_patterns=[f"libero10_task0_{split}/*" for split in REPOS],
+            local_dir=raw_dir,
+        )
+        validate_download(raw_dir)
+    except Exception as error:
+        raise RuntimeError(
+            f"Dataset download from {endpoint} is incomplete. Keep {raw_dir} and rerun to resume after fixing network access."
+        ) from error
     marker.unlink()
-    print(f"Downloaded {DATASET_ID}@{DATASET_REVISION} to {raw_dir}")
+    print(f"Downloaded and verified {DATASET_ID}@{DATASET_REVISION} from {endpoint} to {raw_dir}")
 
 
 def prepare(raw_dir, split, repo_id):

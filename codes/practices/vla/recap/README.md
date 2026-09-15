@@ -9,7 +9,8 @@
 使用 [RLinf/RECAP-Libero10-Task0-48succ-Data](https://huggingface.co/datasets/RLinf/RECAP-Libero10-Task0-48succ-Data/tree/75b382d2c066bcedd8b030285b45c856913f1497)。
 成功和失败轨迹已经包含在数据集中，第一轮离线训练不需要自行采集。
 最终评估目标是 LIBERO-Long（代码名 `libero_10`）的 Task 0：将 alphabet soup 和 tomato sauce 都放进篮子。
-将本目录复制到 OpenPI 的 `examples/recap/`，以下命令全部在 OpenPI 根目录执行。
+本项目只提供需要接入 OpenPI 的增量代码，不包含 OpenPI 本体。必须先将
+`codes/practices/vla/recap/` 复制为 OpenPI 的 `examples/recap/`；以下命令全部在 OpenPI 根目录执行。
 
 ## 1. 机器与环境
 
@@ -30,6 +31,7 @@ cd openpi
 git checkout 215abfb217dbac7d5f1273282331b9b1866c0479
 git submodule update --init --recursive
 cp -R ../dive-into-embodied-ai/codes/practices/vla/recap examples/recap
+test -f examples/recap/run.py && echo "RECAP code is ready"
 
 uv venv --python 3.11
 GIT_LFS_SKIP_SMUDGE=1 uv sync --frozen
@@ -46,15 +48,25 @@ uv run python -c 'import jax; print(jax.devices())'
 每个训练终端先设置以下变量：
 
 ```bash
+# 当前目录必须是 OpenPI 根目录，并且已完成第 1 节的代码复制。
+test -f examples/recap/run.py || { echo "缺少 examples/recap，请先复制 RECAP 代码"; exit 1; }
+cp -R /data1/evan/dive-into-embodied-ai/codes/practices/vla/recap \
+  /data1/evan/openpi/examples/recap
+
 export HF_LEROBOT_HOME="$PWD/data/lerobot"
 export RECAP_SFT_REPO_ID="local/libero10_fewshot_sft"
 export RECAP_REPO_ID="local/libero10_task0_train"
 export RECAP_EVAL_REPO_ID="local/libero10_task0_eval"
 
+# huggingface.co 无法访问时，在启动 Python 前指定镜像：
+export HF_ENDPOINT="https://hf-mirror.com"
+
 uv run python examples/recap/run.py data download
 ```
 
-下载固定 revision `75b382d2c066bcedd8b030285b45c856913f1497` 的三个完整子目录，支持断点续传。
+可直接访问 Hugging Face 时不设置 `HF_ENDPOINT`。脚本会显示实际使用的 endpoint，并在下载后逐个检查三个划分的 metadata、Parquet 和双视角视频；网络失败时不会再把空目录或部分目录报告为下载成功。保留未完成目录后重跑即可断点续传。
+
+下载固定 revision `75b382d2c066bcedd8b030285b45c856913f1497` 的三个完整子目录。
 输出位于 `data/recap/rlinf/`。下面的数量根据该版本实际元数据核对：
 
 | 发布目录 | 内容 | 本例用途 |

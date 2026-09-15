@@ -329,6 +329,27 @@ def test_prepare_published_splits_use_real_lerobot_and_preserve_raw(tmp_path, mo
         data.prepare(raw, split, f"local/{split}")
 
 
+def test_download_validation_rejects_offline_fallback_directory(tmp_path, monkeypatch):
+    import huggingface_hub
+    from examples.recap import data
+
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda **kwargs: str(tmp_path))
+    with pytest.raises(RuntimeError, match="incomplete"):
+        data.download(tmp_path)
+    # Keep the marker and partial files so the next invocation can resume.
+    assert (tmp_path / "INCOMPLETE").is_file()
+
+
+def test_download_validation_accepts_three_complete_splits(tmp_path, monkeypatch):
+    from examples.recap import data
+
+    raw = tmp_path / "raw"
+    for split, success in (("sft", True), ("train", False), ("eval", True)):
+        make_published_split(raw, split, success)
+    monkeypatch.setattr(data, "EXPECTED_EPISODES", dict.fromkeys(data.REPOS, 1))
+    data.validate_download(raw)
+
+
 def test_eval_cannot_be_used_for_training_or_advantage_thresholds(tmp_path, monkeypatch):
     import dataclasses
 
