@@ -23,6 +23,23 @@ from openpi.models import model
 from openpi.training import config
 
 
+def test_worker_batch_converts_torch_storage_to_numpy():
+    import torch
+
+    batch = annotate.numpy_batch(
+        [
+            {
+                "image": torch.zeros(2, 2, 3, dtype=torch.uint8),
+                "state": torch.ones(8),
+                "prompt": "task",
+            }
+        ]
+    )
+    assert isinstance(batch[0]["image"], np.ndarray)
+    assert isinstance(batch[0]["state"], np.ndarray)
+    assert batch[0]["prompt"] == "task"
+
+
 @pytest.mark.parametrize("success", [True, False])
 @pytest.mark.parametrize("n_step", [1, 3, 10])
 def test_perfect_values_have_zero_advantage_including_terminal(success, n_step):

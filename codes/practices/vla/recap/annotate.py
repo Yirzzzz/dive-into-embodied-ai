@@ -11,9 +11,26 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
-def identity_batch(items):
-    """Keep decoded LeRobot samples separate; transforms run in the main process."""
-    return items
+def numpy_batch(items):
+    """Detach worker outputs from Torch storage before crossing process boundaries.
+
+    Sending every tensor through a multiprocessing queue consumes one or more
+    file descriptors and eventually fails on the full 1.56M-frame split.
+    NumPy arrays are serialized without retaining those Torch storage handles.
+    """
+
+    def convert(value):
+        if isinstance(value, dict):
+            return {key: convert(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return tuple(convert(item) for item in value)
+        if isinstance(value, list):
+            return [convert(item) for item in value]
+        if hasattr(value, "detach"):
+            return value.detach().cpu().numpy()
+        return value
+
+    return [convert(item) for item in items]
 
 
 def episode_columns(path):
@@ -95,7 +112,7 @@ def update_features(root, columns):
     temporary.replace(path)
 
 
-def predict_values(root, checkpoint, batch_size, max_frames=None, num_workers=8):
+def predict_values(root, checkpoint, batch_size, max_frames=None, num_workers=4):
     import jax
     import jax.numpy as jnp
     import torch
@@ -149,7 +166,7 @@ def predict_values(root, checkpoint, batch_size, max_frames=None, num_workers=8)
         "shuffle": False,
         "num_workers": num_workers,
         "persistent_workers": num_workers > 0,
-        "collate_fn": identity_batch,
+        "collate_fn": numpy_batch,
     }
     if num_workers > 0:
         loader_kwargs.update(multiprocessing_context="spawn", prefetch_factor=2)
@@ -203,7 +220,7 @@ def main():
     parser.add_argument("--dataset-root", type=pathlib.Path, required=True)
     parser.add_argument("--checkpoint", type=pathlib.Path)
     parser.add_argument("--batch-size", type=int, default=8)
-    parser.add_argument("--num-workers", type=int, default=8, help="Parallel workers used to decode and prefetch video")
+    parser.add_argument("--num-workers", type=int, default=4, help="Parallel workers used to decode and prefetch video")
     parser.add_argument("--n-step", type=int, default=10)
     parser.add_argument("--positive-ratio", type=float, default=0.3)
     parser.add_argument("--failure-penalty", type=float, default=300.0)

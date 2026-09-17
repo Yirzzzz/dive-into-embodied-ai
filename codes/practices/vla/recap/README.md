@@ -202,13 +202,13 @@ uv run python examples/recap/run.py annotate advantages \
   --dataset-root "$HF_LEROBOT_HOME/$RECAP_REPO_ID" \
   --checkpoint "$VALUE_CKPT" \
   --batch-size 72 \
-  --num-workers 8 \
+  --num-workers 4 \
   --n-step 10 \
   --positive-ratio 0.3
 ```
 
-`--num-workers 8` 会并行解码并预取双视角视频，进度日志同时显示处理速度和预计剩余时间。
-如果机器内存或共享内存不足，可降到 `--num-workers 4`；显存不足则降低 `--batch-size`。
+`--num-workers 4` 会并行解码并预取双视角视频，进度日志同时显示处理速度和预计剩余时间。
+如果机器内存或共享内存不足，可降到 `--num-workers 2`；显存不足则降低 `--batch-size`。
 
 ## 4. CFG 微调
 
