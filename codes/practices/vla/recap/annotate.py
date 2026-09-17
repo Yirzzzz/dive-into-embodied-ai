@@ -3,8 +3,14 @@
 import argparse
 import dataclasses
 import json
+import os
 import pathlib
 import time
+
+# This module is imported before JAX for annotation commands. Growing the GPU
+# pool on demand leaves room for CUDA video/worker libraries and avoids JAX's
+# default large reservation on every visible inference device.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import numpy as np
 import pyarrow as pa
@@ -46,6 +52,14 @@ def inference_collate(items):
         return np.stack([np.asarray(value) for value in values])
 
     return np.stack(keys), stack(list(samples))
+
+
+def init_inference_worker(_worker_id):
+    """Keep decode/transform workers off CUDA; only the parent runs the model."""
+
+    os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    os.environ["JAX_PLATFORMS"] = "cpu"
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
 
 def pad_batch(batch, size):
@@ -226,6 +240,7 @@ def predict_values(root, checkpoint, batch_size, max_frames=None, num_workers=4)
         "num_workers": num_workers,
         "persistent_workers": num_workers > 0,
         "collate_fn": inference_collate,
+        "worker_init_fn": init_inference_worker,
     }
     if num_workers > 0:
         loader_kwargs.update(multiprocessing_context="spawn", prefetch_factor=2)
