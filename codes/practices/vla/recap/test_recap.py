@@ -23,21 +23,31 @@ from openpi.models import model
 from openpi.training import config
 
 
-def test_worker_batch_converts_torch_storage_to_numpy():
+def test_inference_worker_transforms_collates_and_pads():
     import torch
 
-    batch = annotate.numpy_batch(
-        [
-            {
-                "image": torch.zeros(2, 2, 3, dtype=torch.uint8),
-                "state": torch.ones(8),
-                "prompt": "task",
+    class TinyDataset:
+        def __len__(self):
+            return 2
+
+        def __getitem__(self, index):
+            return {
+                "episode_index": torch.tensor(3),
+                "frame_index": torch.tensor(index),
+                "actions": torch.arange(7),
+                "state": torch.tensor([index, index + 1]),
             }
-        ]
-    )
-    assert isinstance(batch[0]["image"], np.ndarray)
-    assert isinstance(batch[0]["state"], np.ndarray)
-    assert batch[0]["prompt"] == "task"
+
+    def transform(sample):
+        return {"state": np.asarray(sample["state"]), "actions": sample["actions"]}
+
+    dataset = annotate.InferenceDataset(TinyDataset(), transform)
+    keys, batch = annotate.inference_collate([dataset[0], dataset[1]])
+    np.testing.assert_array_equal(keys, [[3, 0], [3, 1]])
+    assert isinstance(batch["actions"], np.ndarray)
+    assert batch["actions"].shape == (2, 1, 7)
+    padded = annotate.pad_batch(batch, 4)
+    np.testing.assert_array_equal(padded["state"], [[0, 1], [1, 2], [1, 2], [1, 2]])
 
 
 @pytest.mark.parametrize("success", [True, False])

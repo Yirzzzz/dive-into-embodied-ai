@@ -195,6 +195,7 @@ done
 基于 10k checkpoint，计算每个样本动作的优势值，前30%得分的动作认为是 positive 动作：
 
 ```bash
+export CUDA_VISIBLE_DEVICES=0,1,2,3
 export HF_LEROBOT_HOME="$PWD/data/lerobot"
 export RECAP_REPO_ID="local/libero10_task0_train"
 
@@ -202,27 +203,41 @@ uv run python examples/recap/run.py annotate advantages \
   --dataset-root "$HF_LEROBOT_HOME/$RECAP_REPO_ID" \
   --checkpoint "$VALUE_CKPT" \
   --batch-size 72 \
-  --num-workers 4 \
+  --num-workers 8 \
   --n-step 10 \
   --positive-ratio 0.3
 ```
 
-`--num-workers 4` 会并行解码并预取双视角视频，进度日志同时显示处理速度和预计剩余时间。
-如果机器内存或共享内存不足，可降到 `--num-workers 2`；显存不足则降低 `--batch-size`。
+这里的 batch size 是推理全局 batch。脚本会把 batch 沿第一维平均分到
+`CUDA_VISIBLE_DEVICES` 中的全部 GPU；上例为四张卡、每卡 18 帧。视频解码、OpenPI transform
+和 tokenize 在 8 个 worker 中并行完成。batch size 必须能被可见 GPU 数整除；显存允许时可继续提高到
+144 或 288，内存、共享内存或文件句柄紧张时把 `--num-workers` 降到 4 或 2。
 
-## 4. CFG 微调
+## 4. ACP 微调
+
+等待优势标注输出 `Annotated 4096 episodes` 后再开始本步骤。ACP 从 `pi05_base` 初始化，训练 45,000 步；
+下面使用旧实验配方的全局 batch size 72，四张卡各处理 18 个样本。训练时根据 `is_positive` 给任务文本添加
+`Advantage: positive/negative`，并以 0.3 的概率去掉该条件。
 
 ```bash
-export CUDA_VISIBLE_DEVICES=6,7
-uv run python examples/recap/run.py train pi05_recap_acp \
-  --exp-name acp --batch-size 18 --fsdp-devices 2 --no-wandb-enabled
+export CUDA_VISIBLE_DEVICES=0,1,2,3
+unset RECAP_INIT_PARAMS
 
-ACP_CKPT="$(uv run python examples/recap/run.py checkpoint pi05_recap_acp acp)"
+uv run python examples/recap/run.py train pi05_recap_acp \
+  --exp-name acp \
+  --num-train-steps 45000 \
+  --batch-size 72 \
+  --fsdp-devices 4 \
+  --save-interval 10000 \
+  --keep-period 10000 \
+  --no-wandb-enabled
 ```
 
-ACP 默认训练 45,000 步，任务文本添加 `Advantage: positive/negative`，训练时以 0.3 概率去掉条件；推理始终使用 positive。
+action 损失曲线：
 
-## 9. LIBERO 仿真对照评估
+
+
+## 5. LIBERO 仿真对照评估
 
 安装独立 Python 3.8 仿真环境，依赖沿用固定提交的 [OpenPI LIBERO 示例](https://github.com/Physical-Intelligence/openpi/tree/215abfb217dbac7d5f1273282331b9b1866c0479/examples/libero)：
 

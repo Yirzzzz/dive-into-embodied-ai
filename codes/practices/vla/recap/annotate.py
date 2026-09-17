@@ -11,26 +11,70 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 
-def numpy_batch(items):
-    """Detach worker outputs from Torch storage before crossing process boundaries.
+class InferenceDataset:
+    """Apply the expensive OpenPI transforms inside DataLoader workers."""
 
-    Sending every tensor through a multiprocessing queue consumes one or more
-    file descriptors and eventually fails on the full 1.56M-frame split.
-    NumPy arrays are serialized without retaining those Torch storage handles.
-    """
+    def __init__(self, dataset, transform):
+        self.dataset = dataset
+        self.transform = transform
 
-    def convert(value):
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, index):
+        sample = self.dataset[index]
+        key = np.asarray([sample["episode_index"], sample["frame_index"]], dtype=np.int64)
+        # Value inference does not consume actions. A one-step dummy keeps the
+        # normal OpenPI input pipeline reusable without decoding future frames.
+        sample["actions"] = np.asarray(sample["actions"])[None, :]
+        return key, self.transform(sample)
+
+
+def inference_collate(items):
+    """Stack transformed samples as NumPy so workers do not share Torch FDs."""
+
+    keys, samples = zip(*items, strict=True)
+
+    def stack(values):
+        first = values[0]
+        if isinstance(first, dict):
+            return {key: stack([value[key] for value in values]) for key in first}
+        if isinstance(first, tuple):
+            return tuple(stack([value[i] for value in values]) for i in range(len(first)))
+        if isinstance(first, list):
+            return [stack([value[i] for value in values]) for i in range(len(first))]
+        return np.stack([np.asarray(value) for value in values])
+
+    return np.stack(keys), stack(list(samples))
+
+
+def pad_batch(batch, size):
+    """Repeat the final item so the last batch keeps one compiled shape."""
+
+    def first_leaf(value):
         if isinstance(value, dict):
-            return {key: convert(item) for key, item in value.items()}
-        if isinstance(value, tuple):
-            return tuple(convert(item) for item in value)
-        if isinstance(value, list):
-            return [convert(item) for item in value]
-        if hasattr(value, "detach"):
-            return value.detach().cpu().numpy()
+            return first_leaf(next(iter(value.values())))
+        if isinstance(value, (tuple, list)):
+            return first_leaf(value[0])
         return value
 
-    return [convert(item) for item in items]
+    length = len(first_leaf(batch))
+    if length == size:
+        return batch
+    if not 0 < length < size:
+        raise ValueError(f"Cannot pad batch of length {length} to {size}")
+
+    def pad(value):
+        if isinstance(value, dict):
+            return {key: pad(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return tuple(pad(item) for item in value)
+        if isinstance(value, list):
+            return [pad(item) for item in value]
+        value = np.asarray(value)
+        return np.concatenate([value, np.repeat(value[-1:], size - length, axis=0)])
+
+    return pad(batch)
 
 
 def episode_columns(path):
@@ -130,9 +174,23 @@ def predict_values(root, checkpoint, batch_size, max_frames=None, num_workers=4)
         data_cfg,
         norm_stats=checkpoints.load_norm_stats(checkpoint / "assets", data_cfg.asset_id),
     )
-    model = cfg.model.load(model_lib.restore_params(checkpoint / "params", dtype=jnp.bfloat16))
+    devices = jax.devices()
+    if batch_size % len(devices):
+        raise ValueError(
+            f"batch_size ({batch_size}) must be divisible by the number of visible JAX devices ({len(devices)})"
+        )
+    mesh = jax.sharding.Mesh(np.asarray(devices), ("batch",))
+    replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+    data_parallel = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("batch"))
+    model = cfg.model.load(
+        model_lib.restore_params(checkpoint / "params", dtype=jnp.bfloat16, sharding=replicated)
+    )
     model.eval()
-    predict = nnx_utils.module_jit(model.predict_value)
+    predict = nnx_utils.module_jit(
+        model.predict_value,
+        in_shardings=(replicated, data_parallel),
+        out_shardings=replicated,
+    )
     # No action chunk is needed for value inference; use a single dummy action
     # sequence, still keeping the normal observation preprocessing.
     dataset = LeRobotDataset(cfg.data.repo_id, root=root)
@@ -160,37 +218,52 @@ def predict_values(root, checkpoint, batch_size, max_frames=None, num_workers=4)
         if len(indices) == len(dataset)
         else torch.utils.data.Subset(dataset, indices.tolist())
     )
+    selected_dataset = InferenceDataset(selected_dataset, transform)
     loader_kwargs = {
         "dataset": selected_dataset,
         "batch_size": batch_size,
         "shuffle": False,
         "num_workers": num_workers,
         "persistent_workers": num_workers > 0,
-        "collate_fn": numpy_batch,
+        "collate_fn": inference_collate,
     }
     if num_workers > 0:
         loader_kwargs.update(multiprocessing_context="spawn", prefetch_factor=2)
     loader = torch.utils.data.DataLoader(**loader_kwargs)
 
-    started = time.monotonic()
+    warmup_started = time.monotonic()
+    steady_started = None
+    steady_frames = 0
     processed_count = 0
-    for batch_index, samples in enumerate(loader):
-        keys = [(int(s["episode_index"].item()), int(s["frame_index"].item())) for s in samples]
-        processed = []
-        for sample in samples:
-            sample["actions"] = np.asarray(sample["actions"])[None, :]
-            processed.append(transform(sample))
-        padded = processed + [processed[-1]] * (batch_size - len(processed))
-        batch = jax.tree.map(lambda *xs: np.stack(xs), *padded)
-        values = np.asarray(predict(model_lib.Observation.from_dict(batch)))[: len(samples)]
+    print(
+        f"Value inference uses {len(devices)} device(s), global batch {batch_size}, "
+        f"{num_workers} transform/decode worker(s)",
+        flush=True,
+    )
+    for batch_index, (key_array, batch) in enumerate(loader):
+        count = len(key_array)
+        keys = [(int(key[0]), int(key[1])) for key in key_array]
+        batch = pad_batch(batch, batch_size)
+        values = np.asarray(predict(model_lib.Observation.from_dict(batch)))[:count]
         for key, value in zip(keys, values, strict=True):
             if key in predictions:
                 raise ValueError(f"Duplicate frame in dataset: {key}")
             predictions[key] = float(value)
-        processed_count += len(samples)
+        processed_count += count
+        if batch_index == 0:
+            warmup_seconds = time.monotonic() - warmup_started
+            steady_started = time.monotonic()
+            print(
+                f"Value inference warmup: {processed_count}/{len(indices)} "
+                f"(workers + decoding + XLA compile: {warmup_seconds:.1f}s)",
+                flush=True,
+            )
+            continue
+
+        steady_frames += count
         if batch_index % 100 == 0 or processed_count == len(indices):
-            elapsed = max(time.monotonic() - started, 1e-6)
-            rate = processed_count / elapsed
+            elapsed = max(time.monotonic() - steady_started, 1e-6)
+            rate = steady_frames / elapsed
             eta_seconds = (len(indices) - processed_count) / max(rate, 1e-6)
             print(
                 f"Value inference: {processed_count}/{len(indices)} "
