@@ -4,10 +4,16 @@ import argparse
 import dataclasses
 import json
 import pathlib
+import time
 
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+
+
+def identity_batch(items):
+    """Keep decoded LeRobot samples separate; transforms run in the main process."""
+    return items
 
 
 def episode_columns(path):
@@ -89,9 +95,10 @@ def update_features(root, columns):
     temporary.replace(path)
 
 
-def predict_values(root, checkpoint, batch_size, max_frames=None):
+def predict_values(root, checkpoint, batch_size, max_frames=None, num_workers=8):
     import jax
     import jax.numpy as jnp
+    import torch
     from examples.recap.config import get_configs
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
     from openpi import transforms
@@ -127,8 +134,30 @@ def predict_values(root, checkpoint, batch_size, max_frames=None):
     if max_frames is not None and max_frames < len(indices):
         # Same evenly spaced frames across checkpoints, covering the entire split.
         indices = np.linspace(0, len(dataset) - 1, max_frames, dtype=int)
-    for start in range(0, len(indices), batch_size):
-        samples = [dataset[int(i)] for i in indices[start : start + batch_size]]
+
+    # Video decoding is substantially slower than reading the small parquet
+    # tables. Decode and prefetch samples in worker processes while the main
+    # process runs transforms and value inference on the GPU.
+    selected_dataset = (
+        dataset
+        if len(indices) == len(dataset)
+        else torch.utils.data.Subset(dataset, indices.tolist())
+    )
+    loader_kwargs = {
+        "dataset": selected_dataset,
+        "batch_size": batch_size,
+        "shuffle": False,
+        "num_workers": num_workers,
+        "persistent_workers": num_workers > 0,
+        "collate_fn": identity_batch,
+    }
+    if num_workers > 0:
+        loader_kwargs.update(multiprocessing_context="spawn", prefetch_factor=2)
+    loader = torch.utils.data.DataLoader(**loader_kwargs)
+
+    started = time.monotonic()
+    processed_count = 0
+    for batch_index, samples in enumerate(loader):
         keys = [(int(s["episode_index"].item()), int(s["frame_index"].item())) for s in samples]
         processed = []
         for sample in samples:
@@ -141,8 +170,16 @@ def predict_values(root, checkpoint, batch_size, max_frames=None):
             if key in predictions:
                 raise ValueError(f"Duplicate frame in dataset: {key}")
             predictions[key] = float(value)
-        if start % (100 * batch_size) == 0 or start + batch_size >= len(indices):
-            print(f"Value inference: {min(start + batch_size, len(indices))}/{len(indices)}", flush=True)
+        processed_count += len(samples)
+        if batch_index % 100 == 0 or processed_count == len(indices):
+            elapsed = max(time.monotonic() - started, 1e-6)
+            rate = processed_count / elapsed
+            eta_seconds = (len(indices) - processed_count) / max(rate, 1e-6)
+            print(
+                f"Value inference: {processed_count}/{len(indices)} "
+                f"({rate:.1f} frames/s, ETA {eta_seconds / 3600:.2f}h)",
+                flush=True,
+            )
     return predictions
 
 
@@ -166,6 +203,7 @@ def main():
     parser.add_argument("--dataset-root", type=pathlib.Path, required=True)
     parser.add_argument("--checkpoint", type=pathlib.Path)
     parser.add_argument("--batch-size", type=int, default=8)
+    parser.add_argument("--num-workers", type=int, default=8, help="Parallel workers used to decode and prefetch video")
     parser.add_argument("--n-step", type=int, default=10)
     parser.add_argument("--positive-ratio", type=float, default=0.3)
     parser.add_argument("--failure-penalty", type=float, default=300.0)
@@ -179,8 +217,8 @@ def main():
     paths = sorted((root / "data").rglob("*.parquet"))
     if not paths or not (root / "meta/info.json").is_file():
         parser.error("Expected a LeRobot v2 dataset with data/**/*.parquet and meta/info.json")
-    if args.batch_size < 1 or args.n_step < 1 or not 0 < args.positive_ratio < 1:
-        parser.error("batch-size and n-step must be positive; positive-ratio must be in (0, 1)")
+    if args.batch_size < 1 or args.num_workers < 0 or args.n_step < 1 or not 0 < args.positive_ratio < 1:
+        parser.error("batch-size and n-step must be positive; num-workers must be nonnegative; positive-ratio must be in (0, 1)")
     episodes = [episode_columns(path) for path in paths]
     if len({ep for ep, _, _ in episodes}) != len(episodes):
         parser.error("An episode must occupy exactly one parquet file (LeRobot v2 layout)")
@@ -191,7 +229,13 @@ def main():
     if args.stage == "evaluate":
         if source.get("split") != "eval" or args.checkpoint is None or args.output is None or args.max_frames < 1:
             parser.error("evaluate requires a prepared eval split, --checkpoint, --output, and positive --max-frames")
-        predictions = predict_values(root, args.checkpoint.expanduser().resolve(), args.batch_size, args.max_frames)
+        predictions = predict_values(
+            root,
+            args.checkpoint.expanduser().resolve(),
+            args.batch_size,
+            args.max_frames,
+            args.num_workers,
+        )
         result = evaluate_values(paths, predictions)
         result.update(checkpoint=str(args.checkpoint.resolve()), dataset_root=str(root))
         args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -228,7 +272,12 @@ def main():
         for target, (_, _, frames) in zip(targets, episodes, strict=True):
             if target.shape != frames.shape or not np.isfinite(target).all() or np.any((target < -1) | (target > 0)):
                 raise ValueError("Run targets first, or supply finite value_target scalars in [-1, 0]")
-        predictions = predict_values(root, args.checkpoint.expanduser().resolve(), args.batch_size)
+        predictions = predict_values(
+            root,
+            args.checkpoint.expanduser().resolve(),
+            args.batch_size,
+            num_workers=args.num_workers,
+        )
         if len(predictions) != sum(len(frames) for _, _, frames in episodes):
             raise ValueError("LeRobot loader and parquet files have different frame counts")
         task_indices = []
