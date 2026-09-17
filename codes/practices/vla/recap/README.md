@@ -209,8 +209,9 @@ uv run python examples/recap/run.py annotate advantages \
 ```
 
 这里的 batch size 是推理全局 batch。脚本会把 batch 沿第一维平均分到
-`CUDA_VISIBLE_DEVICES` 中的全部 GPU；上例为四张卡、每卡 18 帧。视频解码、OpenPI transform
-和 tokenize 在 8 个 worker 中并行完成。batch size 必须能被可见 GPU 数整除；显存允许时可继续提高到
+`CUDA_VISIBLE_DEVICES` 中的全部 GPU；上例为四张卡、每卡 18 帧。每个 episode 的双视角视频只打开一次，
+再由 8 个 CPU worker 顺序解码、执行 OpenPI transform 和 tokenize，避免按帧反复 seek 同一个 MP4。
+batch size 必须能被可见 GPU 数整除；显存允许时可继续提高到
 144 或 288，内存、共享内存或文件句柄紧张时把 `--num-workers` 降到 4 或 2。
 
 ## 4. ACP 微调

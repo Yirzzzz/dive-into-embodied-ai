@@ -15,25 +15,49 @@ os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import torch
 
 
-class InferenceDataset:
-    """Apply the expensive OpenPI transforms inside DataLoader workers."""
+class InferenceDataset(torch.utils.data.IterableDataset):
+    """Decode each episode once, then transform and yield its selected frames."""
 
-    def __init__(self, dataset, transform):
+    def __init__(self, dataset, transform, indices):
         self.dataset = dataset
         self.transform = transform
+        self.selected = np.zeros(len(dataset), dtype=np.bool_)
+        self.selected[np.asarray(indices, dtype=np.int64)] = True
 
     def __len__(self):
-        return len(self.dataset)
+        return int(self.selected.sum())
 
-    def __getitem__(self, index):
-        sample = self.dataset[index]
-        key = np.asarray([sample["episode_index"], sample["frame_index"]], dtype=np.int64)
-        # Value inference does not consume actions. A one-step dummy keeps the
-        # normal OpenPI input pipeline reusable without decoding future frames.
-        sample["actions"] = np.asarray(sample["actions"])[None, :]
-        return key, self.transform(sample)
+    def __iter__(self):
+        worker = torch.utils.data.get_worker_info()
+        worker_id, worker_count = (0, 1) if worker is None else (worker.id, worker.num_workers)
+        for episode in range(worker_id, self.dataset.num_episodes, worker_count):
+            start = int(self.dataset.episode_data_index["from"][episode])
+            end = int(self.dataset.episode_data_index["to"][episode])
+            absolute_indices = np.flatnonzero(self.selected[start:end]) + start
+            if not len(absolute_indices):
+                continue
+
+            samples = [self.dataset.hf_dataset[int(index)] for index in absolute_indices]
+            timestamps = [float(sample["timestamp"]) for sample in samples]
+            query_timestamps = {key: timestamps for key in self.dataset.meta.video_keys}
+            videos = self.dataset._query_videos(query_timestamps, episode)
+            # LeRobot squeezes the batch axis when only one timestamp is queried.
+            videos = {
+                key: frames[None] if frames.ndim == 3 else frames
+                for key, frames in videos.items()
+            }
+
+            for offset, sample in enumerate(samples):
+                sample = {**{key: frames[offset] for key, frames in videos.items()}, **sample}
+                sample["task"] = self.dataset.meta.tasks[int(sample["task_index"])]
+                key = np.asarray([sample["episode_index"], sample["frame_index"]], dtype=np.int64)
+                # Value inference does not consume actions. A one-step dummy
+                # keeps the normal OpenPI input transforms reusable.
+                sample["actions"] = np.asarray(sample["actions"])[None, :]
+                yield key, self.transform(sample)
 
 
 def inference_collate(items):
@@ -173,7 +197,6 @@ def update_features(root, columns):
 def predict_values(root, checkpoint, batch_size, max_frames=None, num_workers=4):
     import jax
     import jax.numpy as jnp
-    import torch
     from examples.recap.config import get_configs
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
     from openpi import transforms
@@ -227,12 +250,7 @@ def predict_values(root, checkpoint, batch_size, max_frames=None, num_workers=4)
     # Video decoding is substantially slower than reading the small parquet
     # tables. Decode and prefetch samples in worker processes while the main
     # process runs transforms and value inference on the GPU.
-    selected_dataset = (
-        dataset
-        if len(indices) == len(dataset)
-        else torch.utils.data.Subset(dataset, indices.tolist())
-    )
-    selected_dataset = InferenceDataset(selected_dataset, transform)
+    selected_dataset = InferenceDataset(dataset, transform, indices)
     loader_kwargs = {
         "dataset": selected_dataset,
         "batch_size": batch_size,

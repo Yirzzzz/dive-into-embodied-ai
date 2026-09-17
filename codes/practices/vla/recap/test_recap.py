@@ -26,23 +26,11 @@ from openpi.training import config
 def test_inference_worker_transforms_collates_and_pads():
     import torch
 
-    class TinyDataset:
-        def __len__(self):
-            return 2
-
-        def __getitem__(self, index):
-            return {
-                "episode_index": torch.tensor(3),
-                "frame_index": torch.tensor(index),
-                "actions": torch.arange(7),
-                "state": torch.tensor([index, index + 1]),
-            }
-
-    def transform(sample):
-        return {"state": np.asarray(sample["state"]), "actions": sample["actions"]}
-
-    dataset = annotate.InferenceDataset(TinyDataset(), transform)
-    keys, batch = annotate.inference_collate([dataset[0], dataset[1]])
+    items = [
+        (np.array([3, index]), {"state": torch.tensor([index, index + 1]), "actions": torch.arange(7)[None]})
+        for index in range(2)
+    ]
+    keys, batch = annotate.inference_collate(items)
     np.testing.assert_array_equal(keys, [[3, 0], [3, 1]])
     assert isinstance(batch["actions"], np.ndarray)
     assert batch["actions"].shape == (2, 1, 7)
@@ -345,6 +333,10 @@ def test_prepare_published_splits_use_real_lerobot_and_preserve_raw(tmp_path, mo
     assert len(dataset) == 2 and dataset.num_episodes == 1
     np.testing.assert_allclose(dataset[0]["actions"], 0.25)
     assert dataset[0]["image"].shape == (3, 32, 32)
+    stream = annotate.InferenceDataset(dataset, lambda sample: sample, np.arange(2))
+    streamed = list(stream)
+    assert [key.tolist() for key, _ in streamed] == [[0, 0], [0, 1]]
+    assert all(sample["image"].shape == (3, 32, 32) for _, sample in streamed)
     assert dataset[0]["index"] == 0
     assert "return" not in dataset[0]
     assert root.joinpath("videos").is_symlink()
