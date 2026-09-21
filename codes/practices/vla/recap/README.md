@@ -48,12 +48,13 @@ RECAP 项目文件目录：
 
 ```
 codes/practices/vla/recap/
-├── run.py          # 统一命令入口，转发 data/stats/train/annotate/serve/rollout/checkpoint 子命令
+├── run.py          # 统一命令入口，转发 data/stats/train/annotate/serve/serve-value/rollout/checkpoint 子命令
 ├── config.py       # 注册 SFT、value、ACP 配置，定义数据变换、初始化权重和参数冻结规则
 ├── data.py         # 下载、完整性校验并准备 sft/train/eval 三份本地 LeRobot 数据
 ├── value_model.py  # 定义 π₀.₅ 的分布式价值头，以及从 pi05_base 加载骨干权重的逻辑
+├── serve_value.py  # 独立加载价值 checkpoint，为仿真观测提供实时 value 推理
 ├── annotate.py     # 计算 value target、验证价值模型，并生成 advantage 和正负样本标签
-├── rollout.py      # 在 LIBERO 中采集或评估 episode，保存轨迹、视频和成功率结果
+├── rollout.py      # 在 LIBERO 中采集或评估 episode，保存轨迹、视频、value 曲线和成功率
 ├── test_recap.py   # 测试数据处理、回报/优势计算、模型接口和 OpenPI 训练器接入
 └── README.md       # 环境、数据、价值训练、ACP 微调和仿真评估的操作教程
 ```
@@ -265,65 +266,59 @@ PYTHONPATH="$PWD/third_party/libero" examples/libero/.venv/bin/python \
   -c "from libero.libero import benchmark; import openpi_client; print('LIBERO ready')"
 ```
 
-OpenPI 的 LIBERO 示例需要把 `third_party/libero` 加到 Python 搜索路径。`rollout.py` 会自动处理这个路径；
-仅用 Python 命令直接检查 `import libero` 时，需如上设置 `PYTHONPATH`。
+做好环境的前置准备后，就可以开启我们的评测啦！
 
-
-
-若已经额外训练了普通 SFT 对照，终端 A 可先启动它；新终端需要重新设置第 2 节变量，并查询 checkpoint：
+启动模型服务：
 
 ```bash
-SFT_CKPT="$(uv run python examples/recap/run.py checkpoint pi05_recap_sft baseline)"
-uv run python examples/recap/run.py serve --port 8000 policy:checkpoint \
-  --policy.config pi05_recap_sft --policy.dir "$SFT_CKPT"
+ACP_CKPT="$PWD/checkpoints/pi05_recap_acp/acp-b36/180000"
+
+uv run python examples/recap/run.py serve \
+  --port 8000 \
+  policy:checkpoint \
+  --policy.config pi05_recap_acp \
+  --policy.dir "$ACP_CKPT"
 ```
 
-终端 B 执行：
+启动仿真服务：
 
 ```bash
-SFT_CKPT="$(uv run python examples/recap/run.py checkpoint pi05_recap_sft baseline)"
-MUJOCO_GL=egl examples/libero/.venv/bin/python examples/recap/run.py rollout eval \
-  --output data/recap/eval_sft --policy-label "$SFT_CKPT"
+PYTHONPATH="$PWD/third_party/libero" MUJOCO_GL=egl \
+examples/libero/.venv/bin/python examples/recap/run.py rollout eval \
+  --output data/recap/eval_acp_b36_180k \
+  --policy-label "$PWD/checkpoints/pi05_recap_acp/acp-b36/180000" \
+  --num-episodes 20
 ```
 
-评估结束，在终端 A 按 Ctrl+C 停止 SFT 服务，再启动 ACP 服务：
+### 评测时查看 value 曲线
+
+把更新后的 `run.py`、`rollout.py`、新增的 `serve_value.py` 复制到 OpenPI 的 `examples/recap/`。价值模型与 ACP 策略分别开一个服务；二者可用不同的空闲 GPU。价值服务在 OpenPI 主环境运行，不能在 Python 3.8 的 LIBERO 仿真环境中加载。
+
+终端 1（已有 ACP 服务可继续使用）：
 
 ```bash
-ACP_CKPT="$(uv run python examples/recap/run.py checkpoint pi05_recap_acp acp)"
-uv run python examples/recap/run.py serve --port 8000 policy:checkpoint \
-  --policy.config pi05_recap_acp --policy.dir "$ACP_CKPT"
+CUDA_VISIBLE_DEVICES=6 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+uv run python examples/recap/run.py serve --port 8000 \
+  policy:checkpoint --policy.config pi05_recap_acp \
+  --policy.dir "$PWD/checkpoints/pi05_recap_acp/acp-b36/60000"
 ```
 
-终端 B 使用相同协议评估 ACP：
+终端 2（10k value checkpoint）：
 
 ```bash
-ACP_CKPT="$(uv run python examples/recap/run.py checkpoint pi05_recap_acp acp)"
-MUJOCO_GL=egl examples/libero/.venv/bin/python examples/recap/run.py rollout eval \
-  --output data/recap/eval_acp --policy-label "$ACP_CKPT"
-
-python3 - <<'PY'
-import json
-from pathlib import Path
-for name in ('sft', 'acp'):
-    result = json.loads(Path(f'data/recap/eval_{name}/results.json').read_text())
-    assert result['complete'], f'{name} evaluation is incomplete'
-    print(name, result['success_rate'], result['initial_state_ids'])
-PY
+CUDA_VISIBLE_DEVICES=7 XLA_PYTHON_CLIENT_PREALLOCATE=false \
+uv run python examples/recap/run.py serve-value \
+  --checkpoint "$PWD/checkpoints/pi05_recap_value/value/10000" --port 8001
 ```
 
-默认评估初始状态 30..49，共 20 回合；每回合最多 520 个动作，先等待 10 步，每 5 步重新规划。
-两模型使用相同初始状态、环境 seed 和执行协议。这些状态不保证与发布方离线数据的初始状态无重叠。
-脚本自动配置 LIBERO 资源路径，输出视频及 `results.json`；异常会中止，不当作普通失败计入完整报告。
-
-默认 20 回合是教程级验证。要声称算法增益，还需要多随机种子，以及相同新增数据、更新步数下继续普通 SFT 的对照。
-不能把原 SFT 与 ACP 的全部差异归因于 RECAP。
-
-## 实现与验证边界
+终端 3（仿真，输出目录必须是新的）：
 
 ```bash
-uv run python -m pytest examples/recap/test_recap.py -q
+PYTHONPATH="$PWD/third_party/libero" MUJOCO_GL=egl \
+examples/libero/.venv/bin/python examples/recap/run.py rollout eval \
+  --output data/recap/eval_acp_b36_60k_value \
+  --policy-label "$PWD/checkpoints/pi05_recap_acp/acp-b36/60000" \
+  --value-port 8001 --num-episodes 20
 ```
 
-本地 29 项 CPU 测试通过，覆盖数据准备、回报与优势、验证集隔离，以及完整模型在上游训练器中的初始化、反向传播、优化器和 EMA 的形状检查。另用三个划分各一条真实轨迹检查了视频/动作读取，并通过上游入口在 SFT 小样本上计算了 norm stats。
-
-另外使用随机初始化的缩小版骨干，实际验证了 SFT checkpoint → 价值模型初始化 → CPU 梯度更新 → 保存 → 回读预测；这不等于真实 π₀.₅ 权重验证，也不能用来判断显存或任务成功率。完整数据集处理、正式 GPU 训练及真实 LIBERO 评估尚未完成，没有可报告的本例实测成功率。
+每次重规划（默认每 5 个仿真步）会用**动作执行前**的双视角图像、机器人状态和任务文本预测一次 value。终端持续输出数值与简短曲线，`state_030_values.jsonl` 等文件逐条写入并刷新，可以用 `tail -f data/recap/eval_acp_b36_60k_value/state_030_values.jsonl` 查看。每回合结束后生成带 value 曲线的 `*_value.mp4`，路径记录在 `results.json`。value 范围约为 `[-1, 0]`，越接近 0 表示模型预计的剩余回报越高；它是模型预测，不是实时成功判定。视频每帧显示最近一次重规划的 value，曲线点只对应实际采样时刻。已有的普通评测 MP4 没有手腕图像和机器人状态，不能事后准确补算 value，需重新运行带 `--value-port` 的评测。

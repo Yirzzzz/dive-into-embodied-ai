@@ -459,3 +459,18 @@ def test_rollout_records_pre_action_observations_and_only_executed_actions(monke
     assert success and len(frames) == 2
     np.testing.assert_array_equal(frames[0]["state"], np.full(8, 10))
     np.testing.assert_array_equal(frames[1]["actions"], np.arange(7, 14))
+
+    class ValueClient:
+        def reset(self):
+            pass
+
+        def infer(self, obs):
+            assert obs["prompt"] == "task"
+            return {"value": -0.25}
+
+    import io
+
+    samples, log = [], io.StringIO()
+    rollout.run_episode(Environment(), Client(), None, "task", value_client=ValueClient(), value_samples=samples, value_log=log)
+    assert samples == [{"step": 0, "value": -0.25}]
+    assert json.loads(log.getvalue()) == samples[0]

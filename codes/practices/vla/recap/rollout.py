@@ -65,12 +65,21 @@ def observation_fields(obs):
     }
 
 
-def run_episode(env, client, initial_state, task, replan_steps=5):
+def value_sparkline(samples, width=50):
+    bars = "▁▂▃▄▅▆▇█"
+    return "".join(bars[min(7, max(0, int((row["value"] + 1.0) * 8)))] for row in samples[-width:])
+
+
+def run_episode(
+    env, client, initial_state, task, replan_steps=5, value_client=None, value_samples=None, value_log=None
+):
     from examples.libero.main import LIBERO_DUMMY_ACTION
     from openpi_client import image_tools
 
     env.reset()
     client.reset()
+    if value_client is not None:
+        value_client.reset()
     obs = env.set_init_state(initial_state)
     for _ in range(10):
         obs, _, done, _ = env.step(LIBERO_DUMMY_ACTION)
@@ -92,6 +101,15 @@ def run_episode(env, client, initial_state, task, replan_steps=5):
                 "observation/state": frame["state"],
                 "prompt": task,
             }
+            if value_client is not None:
+                value = float(value_client.infer(request)["value"])
+                if not np.isfinite(value):
+                    raise ValueError(f"Value server returned a non-finite prediction: {value}")
+                sample = {"step": len(frames), "value": value}
+                value_samples.append(sample)
+                value_log.write(json.dumps(sample) + "\n")
+                value_log.flush()
+                print(f"value step={sample['step']:03d} V={value:.4f}  {value_sparkline(value_samples)}", flush=True)
             actions = np.asarray(client.infer(request)["actions"], dtype=np.float32)
             if (
                 actions.ndim != 2
@@ -112,6 +130,43 @@ def run_episode(env, client, initial_state, task, replan_steps=5):
     return frames, success
 
 
+def write_value_video(path, frames, samples):
+    """Save a video with the latest measured value and the curve seen so far."""
+    import cv2
+    import imageio
+
+    if not samples:
+        raise ValueError("No value samples to visualize")
+    height, width = frames[0]["image"].shape[:2]
+    panel_height = 112
+    left, right, top, bottom = 32, width - 12, height + 30, height + panel_height - 18
+    if right <= left or bottom <= top:
+        raise ValueError("Video frames are too small for the value plot")
+
+    def position(sample):
+        x = left + round(sample["step"] / max(len(frames) - 1, 1) * (right - left))
+        y = top + round((1.0 - np.clip(sample["value"] + 1.0, 0.0, 1.0)) * (bottom - top))
+        return x, y
+
+    with imageio.get_writer(path, fps=10) as writer:
+        sample_index = 0
+        for step, frame in enumerate(frames):
+            while sample_index + 1 < len(samples) and samples[sample_index + 1]["step"] <= step:
+                sample_index += 1
+            canvas = np.zeros((height + panel_height, width, 3), dtype=np.uint8)
+            canvas[:height] = frame["image"]
+            label = f"V={samples[sample_index]['value']:.3f}  step={step}"
+            cv2.putText(canvas, label, (8, height + 17), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
+            cv2.line(canvas, (left, top), (left, bottom), (90, 90, 90), 1)
+            cv2.line(canvas, (left, bottom), (right, bottom), (90, 90, 90), 1)
+            cv2.putText(canvas, "0", (4, top + 4), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (180, 180, 180), 1)
+            cv2.putText(canvas, "-1", (4, bottom + 3), cv2.FONT_HERSHEY_SIMPLEX, 0.32, (180, 180, 180), 1)
+            for index in range(1, sample_index + 1):
+                cv2.line(canvas, position(samples[index - 1]), position(samples[index]), (100, 230, 100), 2)
+            cv2.circle(canvas, position(samples[sample_index]), 3, (255, 170, 50), -1)
+            writer.append_data(canvas)
+
+
 def write_results(output, results):
     temporary = output / "results.json.tmp"
     temporary.write_text(json.dumps(results, indent=2, default=str) + "\n")
@@ -130,6 +185,8 @@ def main():
     parser.add_argument("--num-episodes", type=int, help="Default: 30 for collect, 20 for eval")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--replan-steps", type=int, default=5)
+    parser.add_argument("--value-port", type=int, help="Optional RECAP value service; sampled at each replan")
+    parser.add_argument("--value-host", help="Value service host (defaults to --host)")
     args = parser.parse_args()
     count = args.num_episodes if args.num_episodes is not None else (30 if args.purpose == "collect" else 20)
     ids = initial_state_ids(args.purpose, count)
@@ -150,6 +207,13 @@ def main():
     if max(ids) >= len(states):
         raise ValueError(f"This LIBERO checkout only has {len(states)} initial states")
     client = WebsocketClientPolicy(args.host, args.port)
+    value_client = None
+    value_metadata = None
+    if args.value_port is not None:
+        value_client = WebsocketClientPolicy(args.value_host or args.host, args.value_port)
+        value_metadata = value_client.get_server_metadata()
+        if value_metadata.get("kind") != "recap_value":
+            raise ValueError(f"Port {args.value_port} is not a RECAP value server: {value_metadata}")
     args.output.mkdir(parents=True)
     results = {
         "purpose": args.purpose,
@@ -158,6 +222,7 @@ def main():
         "task_id": 0,
         "policy_label": args.policy_label,
         "server_metadata": client.get_server_metadata(),
+        "value_server_metadata": value_metadata,
         "seed": args.seed,
         "replan_steps": args.replan_steps,
         "max_steps": 520,
@@ -169,10 +234,23 @@ def main():
     env, description = _get_libero_env(task, 256, args.seed)
     try:
         for state_id in ids:
-            frames, success = run_episode(env, client, states[state_id], description, args.replan_steps)
+            samples = []
+            trace = f"state_{state_id:03d}_values.jsonl"
+            if value_client is None:
+                frames, success = run_episode(env, client, states[state_id], description, args.replan_steps)
+            else:
+                with (args.output / trace).open("w") as log:
+                    frames, success = run_episode(
+                        env, client, states[state_id], description, args.replan_steps,
+                        value_client=value_client, value_samples=samples, value_log=log,
+                    )
             arrays = {key: np.stack([frame[key] for frame in frames]) for key in frames[0]}
             stem = f"state_{state_id:03d}_{'success' if success else 'failure'}"
             record = {"initial_state_id": state_id, "success": success, "steps": len(frames), "video": stem + ".mp4"}
+            if value_client is not None:
+                record["value_trace"] = trace
+                record["value_video"] = stem + "_value.mp4"
+                record["value_samples"] = len(samples)
             if args.purpose == "collect":
                 record["trajectory"] = stem + ".npz"
                 np.savez_compressed(
@@ -184,6 +262,8 @@ def main():
                     initial_state_id=state_id,
                 )
             imageio.mimwrite(args.output / record["video"], arrays["image"], fps=10)
+            if value_client is not None:
+                write_value_video(args.output / record["value_video"], frames, samples)
             results["episodes"].append(record)
             write_results(args.output, results)
             print(f"state={state_id}, success={success}, steps={len(frames)}", flush=True)

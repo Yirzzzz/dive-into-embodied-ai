@@ -14,6 +14,7 @@ COMMANDS = {
     "annotate": "examples.recap.annotate",
     "data": "examples.recap.data",
     "rollout": "examples.recap.rollout",
+    "serve-value": "examples.recap.serve_value",
 }
 
 
@@ -27,7 +28,7 @@ def latest_checkpoint(config_name, exp_name, base=pathlib.Path("checkpoints")):
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] not in (*COMMANDS, "checkpoint"):
-        print("Usage: python examples/recap/run.py {data|stats|train|serve|rollout|annotate|checkpoint} [arguments]")
+        print("Usage: python examples/recap/run.py {data|stats|train|serve|serve-value|rollout|annotate|checkpoint} [arguments]")
         raise SystemExit(0 if "--help" in sys.argv else 2)
     root = pathlib.Path(__file__).resolve().parents[2]
     if pathlib.Path.cwd().resolve() != root or not (root / "src/openpi").is_dir():
