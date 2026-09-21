@@ -10,6 +10,7 @@ import collections
 import json
 import os
 import pathlib
+import sys
 
 import numpy as np
 
@@ -25,6 +26,13 @@ def configure_libero():
     import yaml
 
     root = pathlib.Path(__file__).resolve().parents[2]
+    # The pinned LIBERO checkout is not importable from its editable install
+    # alone; OpenPI's LIBERO example also adds this submodule to PYTHONPATH.
+    libero_source = root / "third_party/libero"
+    if not (libero_source / "libero").is_dir():
+        raise FileNotFoundError(f"LIBERO source is missing: {libero_source}; initialize the submodule first")
+    if str(libero_source) not in sys.path:
+        sys.path.insert(0, str(libero_source))
     directory = pathlib.Path(os.environ.setdefault("LIBERO_CONFIG_PATH", str(root / "data/recap/libero-config")))
     path = directory / "config.yaml"
     if not path.exists():

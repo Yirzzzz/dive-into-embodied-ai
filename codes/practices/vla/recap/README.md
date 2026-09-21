@@ -218,7 +218,7 @@ batch size 必须能被可见 GPU 数整除；显存允许时可继续提高到
 
 等待优势标注输出 `Annotated 4096 episodes` 后再开始本步骤。ACP 从 `pi05_base` 初始化，训练 45,000 步；
 下面使用旧实验配方的全局 batch size 72，四张卡各处理 18 个样本。训练时根据 `is_positive` 给任务文本添加
-`Advantage: positive/negative`，并以 0.3 的概率去掉该条件。
+`Advantage: positive`，并以 0.3 的概率去掉该条件。
 
 ```bash
 export CUDA_VISIBLE_DEVICES=0,1,2,3
@@ -238,20 +238,37 @@ action 损失曲线：
 
 
 
-## 5. LIBERO 仿真对照评估
+## 4. LIBERO 仿真对照评估
 
-安装独立 Python 3.8 仿真环境，依赖沿用固定提交的 [OpenPI LIBERO 示例](https://github.com/Physical-Intelligence/openpi/tree/215abfb217dbac7d5f1273282331b9b1866c0479/examples/libero)：
+准备 LIBERO 源码：
 
-```bash
-sudo apt-get update
-sudo apt-get install -y libegl1 libgl1-mesa-glx libosmesa6 libglfw3 libglib2.0-0
+```cmd
+cd openpi
+git submodule update --init third_party/libero
+```
+
+配置仿真环境，独立于openpi的环境：
+
+```cmd
+cd openpi
+
 uv venv --python 3.8 examples/libero/.venv
 uv pip sync --python examples/libero/.venv/bin/python \
   examples/libero/requirements.txt third_party/libero/requirements.txt \
-  --extra-index-url https://download.pytorch.org/whl/cu113 --index-strategy unsafe-best-match
+  --extra-index-url https://download.pytorch.org/whl/cu113 \
+  --index-strategy unsafe-best-match
+
 uv pip install --python examples/libero/.venv/bin/python \
   -e packages/openpi-client -e third_party/libero
+
+PYTHONPATH="$PWD/third_party/libero" examples/libero/.venv/bin/python \
+  -c "from libero.libero import benchmark; import openpi_client; print('LIBERO ready')"
 ```
+
+OpenPI 的 LIBERO 示例需要把 `third_party/libero` 加到 Python 搜索路径。`rollout.py` 会自动处理这个路径；
+仅用 Python 命令直接检查 `import libero` 时，需如上设置 `PYTHONPATH`。
+
+
 
 若已经额外训练了普通 SFT 对照，终端 A 可先启动它；新终端需要重新设置第 2 节变量，并查询 checkpoint：
 
