@@ -1,6 +1,6 @@
 # π₀.₅ + RECAP：LIBERO-10 Task 0
 
-这组脚本为 OpenPI 增加 RECAP 复现流程：准备 RLinf 的 LeRobot 数据、训练价值模型、标注优势、微调 ACP 策略，并在 LIBERO 中评估成功率与可视化 value。10k/20k 价值模型的验证误差、数据说明和成功回合动图见[完整教程](../../../../docs/practices/vla/recap-libero/index.md)。
+这组脚本为 OpenPI 增加 RECAP 复现流程：准备 RLinf 的 LeRobot 数据、训练价值模型、标注优势、微调 ACP 策略，并在 LIBERO 中评估成功率与可视化 value。10k/20k 价值模型的验证误差、数据说明和成功回合动图见[完整教程](../../../../docs/practices/vla/recap/index.md)。
 
 ## 环境
 
