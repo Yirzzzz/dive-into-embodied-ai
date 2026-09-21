@@ -35,7 +35,11 @@ def main():
         raise SystemExit("Copy recap/ to openpi/examples/recap/ and run from the OpenPI root.")
     revision = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
     if revision != OPENPI_REVISION:
-        raise SystemExit(f"This example targets OpenPI {OPENPI_REVISION}; found {revision}.")
+        print(
+            f"Warning: this example was tested with OpenPI {OPENPI_REVISION}; found {revision}. "
+            "Upstream API changes may require adaptation.",
+            file=sys.stderr,
+        )
     sys.path.insert(0, str(root))
     command = sys.argv.pop(1)
     if command == "checkpoint":
